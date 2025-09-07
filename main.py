@@ -3,22 +3,21 @@
 Coinbase Advanced Trade "sell winners" bot.
 
 Behavior
-- Scopes to one portfolio (PORTFOLIO_UUID preferred, else PORTFOLIO_NAME="bot").
-- Iterates all non-zero balances in that portfolio (or all if scoping info missing).
+- Scopes to one portfolio (PORTFOLIO_UUID preferred; else PORTFOLIO_NAME="bot").
+- Iterates non-zero balances in that portfolio (or all if portfolio info missing).
 - Rebuilds moving-average cost basis from fills (paginated).
-- If (price - avg_cost)/avg_cost >= TARGET_PROFIT_PCT, sells 100% with a market IOC.
+- If (price - avg_cost)/avg_cost >= TARGET_PROFIT_PCT, sells 100% with market IOC.
 - Verbose logging: heartbeat, per-account diagnostics, scan summary.
 
-Env vars (typical):
-  COINBASE_API_KEY=<...>
-  COINBASE_API_SECRET=<...>
+Env vars:
+  COINBASE_API_KEY, COINBASE_API_SECRET
   TARGET_PROFIT_PCT=0.10
   SLEEP_SEC=60
   QUOTE_CURRENCY=USD
-  PORTFOLIO_UUID=<uuid>          # preferred
-  PORTFOLIO_NAME=bot             # used only if UUID not set
-  FALLBACK_TO_LAST_BUY=1         # optional; use last BUY price if avg unknown
-  DEBUG=1                        # optional; more verbose logs
+  PORTFOLIO_UUID=<uuid>            # preferred
+  PORTFOLIO_NAME=bot               # used only if UUID not set
+  FALLBACK_TO_LAST_BUY=1           # optional; use last BUY price if avg unknown
+  DEBUG=1                          # optional; more verbose logs
 """
 
 import os
@@ -29,7 +28,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from coinbase.rest import RESTClient  # pip install coinbase-advanced-py
-
 
 # -----------------------------
 # Config / env
@@ -44,7 +42,6 @@ DEBUG             = os.getenv("DEBUG", "0") not in ("0", "false", "False", "")
 
 client = RESTClient()  # requires COINBASE_API_KEY / COINBASE_API_SECRET
 
-
 # -----------------------------
 # Logging
 # -----------------------------
@@ -57,7 +54,6 @@ def log(msg: str) -> None:
 def dbg(msg: str) -> None:
     if DEBUG:
         print(f"[cb-sell-winners][debug] {_now()} | {msg}", flush=True)
-
 
 # -----------------------------
 # Small utilities
@@ -95,7 +91,6 @@ def round_to_inc(value: Decimal, inc: Decimal) -> Decimal:
         return value
     return (value / inc).to_integral_value(rounding=ROUND_DOWN) * inc
 
-
 # -----------------------------
 # Portfolio scoping
 # -----------------------------
@@ -119,13 +114,11 @@ def ensure_portfolio_uuid() -> Optional[str]:
         log(f"Error listing portfolios: {e}")
     return None
 
-
 # -----------------------------
 # Market data
 # -----------------------------
 def price_for_product(pid: str) -> Optional[Decimal]:
     """Return mid price using /ticker first, then /product_book best bid/ask."""
-    # Try ticker
     try:
         res = client.get(f"/api/v3/brokerage/products/{pid}/ticker")
         price = _get(res, "price") or _get(_get(res, "ticker", {}), "price")
@@ -138,8 +131,6 @@ def price_for_product(pid: str) -> Optional[Decimal]:
             return (bid + ask) / 2
     except Exception as e:
         dbg(f"{pid} | /ticker fetch error: {e}")
-
-    # Fallback: product book best bid/ask
     try:
         book = client.get("/api/v3/brokerage/product_book", params={"product_id": pid, "limit": 1})
         raw_bids = _get(book, "bids", []) or _get(_get(book, "pricebook", {}), "bids", [])
@@ -165,7 +156,6 @@ def get_product_meta(pid: str) -> Dict[str, Decimal]:
         "base_ccy":  p.base_currency_id,
         "quote_ccy": p.quote_currency_id,
     }
-
 
 # -----------------------------
 # Fills & cost basis
@@ -221,13 +211,13 @@ def compute_avg_cost_for_balance(pid: str, portfolio_uuid: Optional[str]) -> Tup
 
     return (None, consumed, last_buy_price)
 
-
 # -----------------------------
-# Accounts listing (with portfolio scoping)
+# Accounts listing & normalize
 # -----------------------------
 def list_accounts(portfolio_uuid: Optional[str]):
     """
     Prefer portfolio-scoped accounts via REST; fallback to unscoped SDK call.
+    Returns a list of raw dicts or SDK objects.
     """
     if portfolio_uuid:
         try:
@@ -239,7 +229,6 @@ def list_accounts(portfolio_uuid: Optional[str]):
             dbg("portfolio-scoped accounts empty; trying unscoped.")
         except Exception as e:
             dbg(f"portfolio-scoped accounts call failed: {e}; trying unscoped.")
-
     try:
         accs = client.get_accounts()
         accounts = getattr(accs, "accounts", []) or []
@@ -249,6 +238,23 @@ def list_accounts(portfolio_uuid: Optional[str]):
         log(f"get_accounts error: {e}")
         return []
 
+def normalize_account(a: Any) -> dict:
+    """
+    Return a dict with at least {currency, available_balance, portfolio_uuid}.
+    Handles both raw dicts (REST) and SDK objects (get_accounts()).
+    """
+    if isinstance(a, dict):
+        return {
+            "currency": str(a.get("currency", "")).upper(),
+            "available_balance": a.get("available_balance"),
+            "portfolio_uuid": a.get("portfolio_uuid"),
+        }
+    else:
+        return {
+            "currency": str(getattr(a, "currency", "")).upper(),
+            "available_balance": getattr(a, "available_balance", None),
+            "portfolio_uuid": getattr(a, "portfolio_uuid", None),
+        }
 
 # -----------------------------
 # Order placement
@@ -261,11 +267,9 @@ def place_sell_order(pid: str, size: Decimal, portfolio_uuid: Optional[str]) -> 
     }
     if portfolio_uuid:
         payload["portfolio_id"] = portfolio_uuid
-
     resp = client.post("/api/v3/brokerage/orders", data=payload)
     oid = (_get(resp, "order_id") or _get(resp, "orderId") or _get(_get(resp, "success_response", {}), "order_id"))
     log(f"{pid} | SELL ALL size={size} submitted (order {oid})")
-
 
 # -----------------------------
 # One scan iteration
@@ -276,32 +280,35 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
     inspected = 0
     nonzero   = 0
 
-    for a in accounts:
-        a_pf = getattr(a, "portfolio_uuid", None) or _get(getattr(a, "hold", {}) if hasattr(a, "hold") else {}, "portfolio_uuid")
+    for raw in accounts:
+        a = normalize_account(raw)
 
         # Only filter by portfolio if we KNOW the account's portfolio and it doesn't match.
-        if portfolio_uuid and a_pf and a_pf != portfolio_uuid:
+        if portfolio_uuid and a.get("portfolio_uuid") and a["portfolio_uuid"] != portfolio_uuid:
             continue
 
-        sym = a.currency.upper()
+        sym = a["currency"]
         inspected += 1
 
-        # Parse available balance
+        # balance
+        bal = None
         try:
-            bal_val = _get(a, "available_balance", {})
-            bal = Decimal(bal_val["value"]) if isinstance(bal_val, dict) else Decimal(str(bal_val))
+            bal_val = a["available_balance"]
+            if isinstance(bal_val, dict):
+                bal = Decimal(str(bal_val.get("value")))
+            elif bal_val is not None:
+                bal = Decimal(str(bal_val))
         except Exception:
-            dbg(f"{sym} | could not parse available_balance; skipping account row")
+            dbg(f"{sym} | could not parse available_balance; skipping")
             continue
 
-        dbg(f"{sym} | balance={bal} (acct_portfolio={a_pf or 'unknown'})")
+        dbg(f"{sym} | balance={bal} (acct_portfolio={a.get('portfolio_uuid') or 'unknown'})")
 
         if sym == QUOTE_CURRENCY:
             dbg(f"{sym} | is quote currency; skip")
             continue
-
-        if bal <= 0:
-            dbg(f"{sym} | zero balance; skip")
+        if bal is None or bal <= 0:
+            dbg(f"{sym} | zero/invalid balance; skip")
             continue
 
         nonzero += 1
@@ -335,16 +342,19 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
 
         if gain >= TARGET_PROFIT_PCT:
             try:
-                # Re-read balance & respect increment immediately before order
+                # Re-read accounts and normalize again just before the order
                 accounts_now = list_accounts(portfolio_uuid)
                 base_bal = Decimal("0")
-                for acc in accounts_now:
-                    acc_pf = getattr(acc, "portfolio_uuid", None) or _get(getattr(acc, "hold", {}) if hasattr(acc, "hold") else {}, "portfolio_uuid")
-                    if portfolio_uuid and acc_pf and acc_pf != portfolio_uuid:
+                for r in accounts_now:
+                    acc = normalize_account(r)
+                    if portfolio_uuid and acc.get("portfolio_uuid") and acc["portfolio_uuid"] != portfolio_uuid:
                         continue
-                    if acc.currency == _get(meta, "base_ccy"):
-                        bal_val2 = _get(acc, "available_balance", {})
-                        base_bal = Decimal(bal_val2["value"]) if isinstance(bal_val2, dict) else Decimal(str(bal_val2))
+                    if acc["currency"] == _get(meta, "base_ccy"):
+                        bv = acc["available_balance"]
+                        if isinstance(bv, dict):
+                            base_bal = Decimal(str(bv.get("value")))
+                        elif bv is not None:
+                            base_bal = Decimal(str(bv))
                         break
                 size = round_to_inc(base_bal, _get(meta, "base_inc"))
                 if size > 0:
@@ -355,7 +365,6 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
                 log(f"{pid} | SELL flow error: {type(e).__name__}: {e}")
 
     log(f"Scan summary: inspected={inspected}, nonzero={nonzero}")
-
 
 # -----------------------------
 # Main loop
@@ -374,7 +383,6 @@ def main():
         except Exception as e:
             log(f"Top-level error: {type(e).__name__}: {e}")
         time.sleep(max(5, SLEEP_SEC))
-
 
 if __name__ == "__main__":
     main()
