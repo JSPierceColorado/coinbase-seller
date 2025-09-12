@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Coinbase Advanced Trade "sell winners" bot.
+Coinbase Advanced Trade — "sell winners" bot (minimal logs).
 
 Behavior
-- Scopes to one portfolio (PORTFOLIO_UUID preferred; else PORTFOLIO_NAME="bot").
-- Iterates non-zero balances in that portfolio (or all if portfolio info missing).
-- Rebuilds moving-average cost basis from fills (paginated).
+- Optionally scopes to a single portfolio (PORTFOLIO_UUID preferred; else PORTFOLIO_NAME="bot").
+- Iterates non-zero balances (excluding quote currency).
+- Rebuilds moving-average cost basis from fills (paginated, oldest->newest).
 - If (price - avg_cost)/avg_cost >= TARGET_PROFIT_PCT, sells 100% with market IOC.
-- Verbose logging: heartbeat, per-account diagnostics, scan summary.
+
+Logs (concise)
+- Per-asset evaluation line:
+    <PID> | bal=<base> avg=<avg or unknown> px=<price or unknown> gain=<%> target=<%> -> <action>
+- SELL lines:
+    <PID> | SELL size=<size> (order <id>)   OR   <PID> | SELL error: <reason>
 
 Env vars:
   COINBASE_API_KEY, COINBASE_API_SECRET
@@ -17,12 +22,12 @@ Env vars:
   PORTFOLIO_UUID=<uuid>            # preferred
   PORTFOLIO_NAME=bot               # used only if UUID not set
   FALLBACK_TO_LAST_BUY=1           # optional; use last BUY price if avg unknown
-  DEBUG=1                          # optional; more verbose logs
 """
 
 import os
 import re
 import time
+import uuid
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -38,22 +43,17 @@ QUOTE_CURRENCY    = os.getenv("QUOTE_CURRENCY", "USD").upper()
 FALLBACK_TO_LAST_BUY = os.getenv("FALLBACK_TO_LAST_BUY", "0") not in ("0", "false", "False", "")
 PORTFOLIO_UUID    = os.getenv("PORTFOLIO_UUID", "").strip()
 PORTFOLIO_NAME    = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
-DEBUG             = os.getenv("DEBUG", "0") not in ("0", "false", "False", "")
 
 client = RESTClient()  # requires COINBASE_API_KEY / COINBASE_API_SECRET
 
 # -----------------------------
-# Logging
+# Minimal logging
 # -----------------------------
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
 def log(msg: str) -> None:
     print(f"[cb-sell-winners] {_now()} | {msg}", flush=True)
-
-def dbg(msg: str) -> None:
-    if DEBUG:
-        print(f"[cb-sell-winners][debug] {_now()} | {msg}", flush=True)
 
 # -----------------------------
 # Small utilities
@@ -109,7 +109,7 @@ def ensure_portfolio_uuid() -> Optional[str]:
                 if PORTFOLIO_UUID:
                     log(f"Using portfolio '{PORTFOLIO_NAME}' ({PORTFOLIO_UUID})")
                     return PORTFOLIO_UUID
-        log(f"Portfolio named '{PORTFOLIO_NAME}' not found; defaulting to ALL portfolios.")
+        log(f"Portfolio named '{PORTFOLIO_NAME}' not found; defaulting to ALL.")
     except Exception as e:
         log(f"Error listing portfolios: {e}")
     return None
@@ -129,8 +129,8 @@ def price_for_product(pid: str) -> Optional[Decimal]:
         ask = _to_decimal_maybe(_get(res, "ask"))
         if bid is not None and ask is not None:
             return (bid + ask) / 2
-    except Exception as e:
-        dbg(f"{pid} | /ticker fetch error: {e}")
+    except Exception:
+        pass
     try:
         book = client.get("/api/v3/brokerage/product_book", params={"product_id": pid, "limit": 1})
         raw_bids = _get(book, "bids", []) or _get(_get(book, "pricebook", {}), "bids", [])
@@ -145,8 +145,8 @@ def price_for_product(pid: str) -> Optional[Decimal]:
         a = first_price(raw_asks)
         if b is not None and a is not None:
             return (b + a) / 2
-    except Exception as e:
-        dbg(f"{pid} | /product_book fetch error: {e}")
+    except Exception:
+        pass
     return None
 
 def get_product_meta(pid: str) -> Dict[str, Decimal]:
@@ -166,7 +166,7 @@ def fetch_fills_pages(pid: str, portfolio_uuid: Optional[str], max_pages: int = 
         params = {"product_id": pid, "limit": 250}
         if cursor:
             params["cursor"] = cursor
-        # IMPORTANT: the AT API uses `retail_portfolio_id` (NOT `portfolio_id`) for filters.
+        # Use `retail_portfolio_id` when scoping explicitly
         if portfolio_uuid:
             params["retail_portfolio_id"] = portfolio_uuid
         res = client.get("/api/v3/brokerage/orders/historical/fills", params=params)
@@ -222,19 +222,15 @@ def list_accounts(portfolio_uuid: Optional[str]):
     """
     if portfolio_uuid:
         try:
-            # If you want server-side scoping, this filter key is `retail_portfolio_id`.
             res = client.get("/api/v3/brokerage/accounts", params={"limit": 250, "retail_portfolio_id": portfolio_uuid})
             accounts = _get(res, "accounts") or getattr(res, "accounts", []) or []
             if accounts:
-                dbg(f"portfolio-scoped accounts: {len(accounts)}")
                 return accounts
-            dbg("portfolio-scoped accounts empty; trying unscoped.")
-        except Exception as e:
-            dbg(f"portfolio-scoped accounts call failed: {e}; trying unscoped.")
+        except Exception:
+            pass
     try:
         accs = client.get_accounts()
         accounts = getattr(accs, "accounts", []) or []
-        dbg(f"unscoped accounts: {len(accounts)}")
         return accounts
     except Exception as e:
         log(f"get_accounts error: {e}")
@@ -262,31 +258,31 @@ def normalize_account(a: Any) -> dict:
 # Order placement
 # -----------------------------
 def place_sell_order(pid: str, size: Decimal, portfolio_uuid: Optional[str]) -> None:
+    # Valid, short client order id
+    coid = uuid.uuid4().hex  # 32 lowercase hex chars
+
     payload = {
+        "client_order_id": coid,
         "product_id": pid,
         "side": "SELL",
         "order_configuration": {"market_market_ioc": {"base_size": f"{size.normalize():f}"}},
     }
-    # IMPORTANT: Create Order expects `retail_portfolio_id` if you need to specify it.
+    # Include only when present; do NOT send empty/None fields.
     if portfolio_uuid:
         payload["retail_portfolio_id"] = portfolio_uuid
 
-    # The SDK accepts `data=` and handles JSON encoding internally.
     resp = client.post("/api/v3/brokerage/orders", data=payload)
 
     oid = (_get(resp, "order_id")
            or _get(resp, "orderId")
            or _get(_get(resp, "success_response", {}), "order_id"))
-    log(f"{pid} | SELL ALL size={size} submitted (order {oid})")
+    log(f"{pid} | SELL size={size} (order {oid})")
 
 # -----------------------------
-# One scan iteration
+# One scan iteration (concise logs)
 # -----------------------------
 def scan_once(portfolio_uuid: Optional[str]) -> None:
     accounts = list_accounts(portfolio_uuid)
-
-    inspected = 0
-    nonzero   = 0
 
     for raw in accounts:
         a = normalize_account(raw)
@@ -296,37 +292,30 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
             continue
 
         sym = a["currency"]
-        inspected += 1
+        if sym == QUOTE_CURRENCY:
+            continue
 
         # balance
         bal = None
+        bal_val = a["available_balance"]
         try:
-            bal_val = a["available_balance"]
             if isinstance(bal_val, dict):
                 bal = Decimal(str(bal_val.get("value")))
             elif bal_val is not None:
                 bal = Decimal(str(bal_val))
         except Exception:
-            dbg(f"{sym} | could not parse available_balance; skipping")
             continue
 
-        dbg(f"{sym} | balance={bal} (acct_portfolio={a.get('portfolio_uuid') or 'unknown'})")
-
-        if sym == QUOTE_CURRENCY:
-            dbg(f"{sym} | is quote currency; skip")
-            continue
         if bal is None or bal <= 0:
-            dbg(f"{sym} | zero/invalid balance; skip")
             continue
 
-        nonzero += 1
         pid = f"{sym}-{QUOTE_CURRENCY}"
 
         # Product meta
         try:
             meta = get_product_meta(pid)
-        except Exception as e:
-            log(f"{sym} | No product {pid} or meta error: {e}; skip.")
+        except Exception:
+            log(f"{pid} | bal={bal} avg=unknown px=unknown gain=0.00% target={int(TARGET_PROFIT_PCT*100)}% -> skip (no product)")
             continue
 
         # Average cost
@@ -334,23 +323,24 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
         if avg is None:
             if FALLBACK_TO_LAST_BUY and last_buy is not None:
                 avg = last_buy
-                log(f"{pid} | Using last BUY price fallback avg={avg} after {used} fills.")
             else:
-                log(f"{pid} | Unknown avg cost after {used} fills; skip.")
+                log(f"{pid} | bal={bal} avg=unknown px=unknown gain=0.00% target={int(TARGET_PROFIT_PCT*100)}% -> skip")
                 continue
 
         # Price
         px = price_for_product(pid)
-        if px is None:
-            log(f"{pid} | Could not fetch ticker/book price; skip.")
+        if px is None or avg <= 0:
+            log(f"{pid} | bal={bal} avg={avg if avg is not None else 'unknown'} px=unknown gain=0.00% target={int(TARGET_PROFIT_PCT*100)}% -> skip")
             continue
 
         gain = (px - avg) / avg
-        log(f"{pid} | avg={avg:.8f} price={px:.8f} gain={float(gain)*100:.2f}%")
+        gain_pct = float(gain) * 100.0
+        action = "SELL" if gain >= TARGET_PROFIT_PCT else "skip"
+        log(f"{pid} | bal={bal} avg={avg:.8f} px={px:.8f} gain={gain_pct:.2f}% target={int(TARGET_PROFIT_PCT*100)}% -> {action}")
 
         if gain >= TARGET_PROFIT_PCT:
             try:
-                # Re-read accounts and normalize again just before the order
+                # Fresh read for most recent base balance just before order
                 accounts_now = list_accounts(portfolio_uuid)
                 base_bal = Decimal("0")
                 for r in accounts_now:
@@ -368,25 +358,22 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
                 if size > 0:
                     place_sell_order(pid, size, portfolio_uuid)
                 else:
-                    log(f"{pid} | Balance rounds to 0 with increment; nothing to sell.")
+                    log(f"{pid} | SELL size=0 (rounding) -> skip")
             except Exception as e:
-                log(f"{pid} | SELL flow error: {type(e).__name__}: {e}")
-
-    log(f"Scan summary: inspected={inspected}, nonzero={nonzero}")
+                log(f"{pid} | SELL error: {type(e).__name__}: {e}")
 
 # -----------------------------
 # Main loop
 # -----------------------------
 def main():
     pf = ensure_portfolio_uuid()
-    scope_msg = f"portfolio={pf}" if pf else "portfolio=ALL"
-    log(f"Started | target_profit={int(TARGET_PROFIT_PCT*100)}% | quote={QUOTE_CURRENCY} | {scope_msg}")
+    scope_msg = pf if pf else "ALL"
+    log(f"Started | target={int(TARGET_PROFIT_PCT*100)}% | quote={QUOTE_CURRENCY} | portfolio={scope_msg}")
 
     loop = 0
     while True:
         loop += 1
         try:
-            log(f"Heartbeat: loop={loop}, sleep={SLEEP_SEC}s, debug={'on' if DEBUG else 'off'}")
             scan_once(pf)
         except Exception as e:
             log(f"Top-level error: {type(e).__name__}: {e}")
