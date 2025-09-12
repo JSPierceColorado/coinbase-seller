@@ -166,8 +166,9 @@ def fetch_fills_pages(pid: str, portfolio_uuid: Optional[str], max_pages: int = 
         params = {"product_id": pid, "limit": 250}
         if cursor:
             params["cursor"] = cursor
+        # IMPORTANT: the AT API uses `retail_portfolio_id` (NOT `portfolio_id`) for filters.
         if portfolio_uuid:
-            params["portfolio_id"] = portfolio_uuid
+            params["retail_portfolio_id"] = portfolio_uuid
         res = client.get("/api/v3/brokerage/orders/historical/fills", params=params)
         fills = _get(res, "fills") or _get(res, "data") or getattr(res, "fills", []) or []
         def f_time(f): return _get(f, "trade_time") or _get(f, "created_at") or _get(f, "time") or ""
@@ -221,7 +222,8 @@ def list_accounts(portfolio_uuid: Optional[str]):
     """
     if portfolio_uuid:
         try:
-            res = client.get("/api/v3/brokerage/accounts", params={"limit": 250, "portfolio_uuid": portfolio_uuid})
+            # If you want server-side scoping, this filter key is `retail_portfolio_id`.
+            res = client.get("/api/v3/brokerage/accounts", params={"limit": 250, "retail_portfolio_id": portfolio_uuid})
             accounts = _get(res, "accounts") or getattr(res, "accounts", []) or []
             if accounts:
                 dbg(f"portfolio-scoped accounts: {len(accounts)}")
@@ -265,10 +267,16 @@ def place_sell_order(pid: str, size: Decimal, portfolio_uuid: Optional[str]) -> 
         "side": "SELL",
         "order_configuration": {"market_market_ioc": {"base_size": f"{size.normalize():f}"}},
     }
+    # IMPORTANT: Create Order expects `retail_portfolio_id` if you need to specify it.
     if portfolio_uuid:
-        payload["portfolio_id"] = portfolio_uuid
+        payload["retail_portfolio_id"] = portfolio_uuid
+
+    # The SDK accepts `data=` and handles JSON encoding internally.
     resp = client.post("/api/v3/brokerage/orders", data=payload)
-    oid = (_get(resp, "order_id") or _get(resp, "orderId") or _get(_get(resp, "success_response", {}), "order_id"))
+
+    oid = (_get(resp, "order_id")
+           or _get(resp, "orderId")
+           or _get(_get(resp, "success_response", {}), "order_id"))
     log(f"{pid} | SELL ALL size={size} submitted (order {oid})")
 
 # -----------------------------
