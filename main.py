@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-Coinbase Advanced Trade — "sell winners" bot (minimal logs).
+Coinbase Advanced Trade — "sell winners" bot (fixed cost-basis + sturdier quotes).
+
+What's fixed / improved
+- Cost basis now computed from the FULL fill history (all pages), globally
+  sorted oldest→newest. No early return after a page.
+- Fewer "avg=unknown" skips: we scan everything and only return None when the
+  final net units are 0 from the fills we could retrieve.
+- Fresh price re-check just before selling to avoid dumping after a quick dip.
+- More robust price fetching: tries /ticker, then best bid/ask, then last trade.
+- Logging remains concise and backward-compatible.
 
 Behavior
 - Optionally scopes to a single portfolio (PORTFOLIO_UUID preferred; else PORTFOLIO_NAME="bot").
 - Iterates non-zero balances (excluding quote currency).
-- Rebuilds moving-average cost basis from fills (paginated, oldest->newest).
+- Rebuilds moving-average cost basis from fills (all pages, oldest->newest).
 - If (price - avg_cost)/avg_cost >= TARGET_PROFIT_PCT, sells 100% with market IOC.
 
 Logs (concise)
@@ -22,6 +31,7 @@ Env vars:
   PORTFOLIO_UUID=<uuid>            # preferred
   PORTFOLIO_NAME=bot               # used only if UUID not set
   FALLBACK_TO_LAST_BUY=1           # optional; use last BUY price if avg unknown
+  MAX_FILL_PAGES=200               # pagination cap for fills (250 fills/page)
 """
 
 import os
@@ -43,6 +53,7 @@ QUOTE_CURRENCY    = os.getenv("QUOTE_CURRENCY", "USD").upper()
 FALLBACK_TO_LAST_BUY = os.getenv("FALLBACK_TO_LAST_BUY", "0") not in ("0", "false", "False", "")
 PORTFOLIO_UUID    = os.getenv("PORTFOLIO_UUID", "").strip()
 PORTFOLIO_NAME    = os.getenv("PORTFOLIO_NAME", "bot").strip() if not PORTFOLIO_UUID else ""
+MAX_FILL_PAGES    = int(os.getenv("MAX_FILL_PAGES", "200"))
 
 client = RESTClient()  # requires COINBASE_API_KEY / COINBASE_API_SECRET
 
@@ -87,7 +98,7 @@ def _to_decimal_maybe(v) -> Optional[Decimal]:
     return None
 
 def round_to_inc(value: Decimal, inc: Decimal) -> Decimal:
-    if inc <= 0:
+    if inc is None or inc <= 0:
         return value
     return (value / inc).to_integral_value(rounding=ROUND_DOWN) * inc
 
@@ -118,7 +129,8 @@ def ensure_portfolio_uuid() -> Optional[str]:
 # Market data
 # -----------------------------
 def price_for_product(pid: str) -> Optional[Decimal]:
-    """Return mid price using /ticker first, then /product_book best bid/ask."""
+    """Return a best-effort mid/last price."""
+    # 1) Try the /ticker endpoint
     try:
         res = client.get(f"/api/v3/brokerage/products/{pid}/ticker")
         price = _get(res, "price") or _get(_get(res, "ticker", {}), "price")
@@ -131,6 +143,8 @@ def price_for_product(pid: str) -> Optional[Decimal]:
             return (bid + ask) / 2
     except Exception:
         pass
+
+    # 2) Try best bid/ask from product_book
     try:
         book = client.get("/api/v3/brokerage/product_book", params={"product_id": pid, "limit": 1})
         raw_bids = _get(book, "bids", []) or _get(_get(book, "pricebook", {}), "bids", [])
@@ -147,70 +161,92 @@ def price_for_product(pid: str) -> Optional[Decimal]:
             return (b + a) / 2
     except Exception:
         pass
+
+    # 3) Final fallback: last trade
+    try:
+        trades = client.get(f"/api/v3/brokerage/products/{pid}/trades", params={"limit": 1})
+        tlist = _get(trades, "trades") or _get(trades, "data") or []
+        if tlist:
+            last = tlist[0]
+            p = _to_decimal_maybe(_get(last, "price"))
+            if p is not None:
+                return p
+    except Exception:
+        pass
+
     return None
 
 def get_product_meta(pid: str) -> Dict[str, Decimal]:
     p = client.get_product(product_id=pid)
+    # Some SDKs expose .base_increment, etc.; normalize to Decimals
     return {
-        "base_inc":  Decimal(p.base_increment),
-        "base_ccy":  p.base_currency_id,
-        "quote_ccy": p.quote_currency_id,
+        "base_inc":  Decimal(str(getattr(p, "base_increment", "0.00000001"))),
+        "base_ccy":  str(getattr(p, "base_currency_id", pid.split("-")[0])),
+        "quote_ccy": str(getattr(p, "quote_currency_id", pid.split("-")[-1])),
     }
 
 # -----------------------------
-# Fills & cost basis
+# Fills & cost basis (FIXED)
 # -----------------------------
-def fetch_fills_pages(pid: str, portfolio_uuid: Optional[str], max_pages: int = 20) -> Iterable[List[dict]]:
+def _fill_time_key(f) -> str:
+    return str(_get(f, "trade_time") or _get(f, "created_at") or _get(f, "time") or "")
+
+def fetch_all_fills(pid: str, portfolio_uuid: Optional[str], max_pages: int = MAX_FILL_PAGES) -> List[dict]:
     cursor = None
+    out: List[dict] = []
     for _ in range(max_pages):
         params = {"product_id": pid, "limit": 250}
         if cursor:
             params["cursor"] = cursor
-        # Use `retail_portfolio_id` when scoping explicitly
         if portfolio_uuid:
             params["retail_portfolio_id"] = portfolio_uuid
         res = client.get("/api/v3/brokerage/orders/historical/fills", params=params)
         fills = _get(res, "fills") or _get(res, "data") or getattr(res, "fills", []) or []
-        def f_time(f): return _get(f, "trade_time") or _get(f, "created_at") or _get(f, "time") or ""
-        fills_sorted = sorted(fills, key=f_time)
-        if not fills_sorted:
+        if not fills:
             break
-        yield fills_sorted
+        out.extend(fills)
         cursor = _get(res, "cursor") or _get(res, "next_cursor") or _get(res, "next")
         if not cursor:
             break
+    out.sort(key=_fill_time_key)  # GLOBAL oldest→newest
+    return out
 
 def compute_avg_cost_for_balance(pid: str, portfolio_uuid: Optional[str]) -> Tuple[Optional[Decimal], int, Optional[Decimal]]:
     """
-    Moving-average method over fills (oldest->newest).
+    True moving-average over the FULL fill history (oldest→newest).
     Returns (avg_cost, fills_consumed, last_buy_price).
     """
+    fills = fetch_all_fills(pid, portfolio_uuid, max_pages=MAX_FILL_PAGES)
+
     units = Decimal("0")
     cost  = Decimal("0")
-    consumed = 0
     last_buy_price: Optional[Decimal] = None
+    consumed = 0
 
-    for page in fetch_fills_pages(pid, portfolio_uuid, max_pages=20):
-        for f in page:
-            side  = str(_get(f, "side", "")).upper()
-            qty   = _to_decimal_maybe(_get(f, "size") or _get(f, "base_size") or _get(f, "filled_size"))
-            price = _to_decimal_maybe(_get(f, "price"))
-            if qty is None or price is None or qty <= 0 or price <= 0:
-                continue
-            if side == "BUY":
-                units += qty
-                cost  += qty * price
-                last_buy_price = price
-            elif side == "SELL" and units > 0:
-                avg = cost / units
-                consume = qty if qty <= units else units
-                cost  -= avg * consume
-                units -= consume
-            consumed += 1
-        if units > 0:
-            return (cost / units, consumed, last_buy_price)
+    for f in fills:
+        side  = str(_get(f, "side", "")).upper()
+        qty   = _to_decimal_maybe(_get(f, "size") or _get(f, "base_size") or _get(f, "filled_size"))
+        price = _to_decimal_maybe(_get(f, "price"))
+        if qty is None or price is None or qty <= 0 or price <= 0:
+            continue
 
-    return (None, consumed, last_buy_price)
+        if side == "BUY":
+            units += qty
+            cost  += qty * price
+            last_buy_price = price
+        elif side == "SELL" and units > 0:
+            # Reduce cost using current moving-average
+            avg = cost / units
+            consume = qty if qty <= units else units
+            cost  -= avg * consume
+            units -= consume
+
+        consumed += 1
+
+    if units > 0:
+        return (cost / units, consumed, last_buy_price)
+    else:
+        return (None, consumed, last_buy_price)
 
 # -----------------------------
 # Accounts listing & normalize
@@ -318,7 +354,7 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
             log(f"{pid} | bal={bal} avg=unknown px=unknown gain=0.00% target={int(TARGET_PROFIT_PCT*100)}% -> skip (no product)")
             continue
 
-        # Average cost
+        # Average cost over ALL fills
         avg, used, last_buy = compute_avg_cost_for_balance(pid, portfolio_uuid)
         if avg is None:
             if FALLBACK_TO_LAST_BUY and last_buy is not None:
@@ -327,7 +363,7 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
                 log(f"{pid} | bal={bal} avg=unknown px=unknown gain=0.00% target={int(TARGET_PROFIT_PCT*100)}% -> skip")
                 continue
 
-        # Price
+        # Price (initial)
         px = price_for_product(pid)
         if px is None or avg <= 0:
             log(f"{pid} | bal={bal} avg={avg if avg is not None else 'unknown'} px=unknown gain=0.00% target={int(TARGET_PROFIT_PCT*100)}% -> skip")
@@ -354,7 +390,19 @@ def scan_once(portfolio_uuid: Optional[str]) -> None:
                         elif bv is not None:
                             base_bal = Decimal(str(bv))
                         break
+
                 size = round_to_inc(base_bal, _get(meta, "base_inc"))
+
+                # Re-check price and threshold right before placing order
+                px2 = price_for_product(pid)
+                if px2 is None:
+                    log(f"{pid} | SELL aborted: no fresh price")
+                    continue
+                gain2 = (px2 - avg) / avg
+                if gain2 < TARGET_PROFIT_PCT:
+                    log(f"{pid} | SELL aborted: gain dropped to {float(gain2)*100.0:.2f}%")
+                    continue
+
                 if size > 0:
                     place_sell_order(pid, size, portfolio_uuid)
                 else:
